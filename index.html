@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LSTM Next-Step Predictor — Sine Waves (React)</title>
+
+  <!-- React + ReactDOM + Babel (for JSX in browser) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/babel-standalone@6/babel.min.js"></script>
+
+  <!-- TensorFlow.js + Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: #0d0d0d;
+      color: #fff;
+      font-family: Arial, sans-serif;
+    }
+    #root {
+      padding: 20px;
+    }
+    h1, h2, h3 {
+      color: #90caf9;
+    }
+    .subtitle {
+      color: #ccc;
+      font-size: 14px;
+      margin-top: -4px;
+      margin-bottom: 16px;
+    }
+    .panel {
+      background: #1b1b1b;
+      border-radius: 10px;
+      border: 1px solid #333;
+      padding: 16px;
+      margin-top: 20px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    label {
+      font-size: 12px;
+      display: block;
+      margin-bottom: 2px;
+    }
+    input {
+      width: 100%;
+      padding: 5px 7px;
+      border-radius: 6px;
+      border: none;
+      outline: none;
+    }
+    button {
+      padding: 7px 13px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      background: #1976d2;
+      color: #fff;
+      font-size: 13px;
+      margin-right: 6px;
+      margin-top: 6px;
+    }
+    button.secondary {
+      background: #455a64;
+    }
+    button:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+    canvas {
+      background: #111;
+      border-radius: 10px;
+      margin-top: 10px;
+    }
+    #status {
+      background: #111;
+      padding: 10px;
+      border-radius: 8px;
+      font-size: 11px;
+      font-family: monospace;
+      height: 120px;
+      overflow-y: auto;
+      white-space: pre-line;
+    }
+    .sample-buttons button {
+      background: #263238;
+      margin-bottom: 4px;
+    }
+    summary {
+      cursor: pointer;
+      color: #64b5f6;
+      font-size: 14px;
+    }
+    .diagram {
+      display: flex;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .diagram .box {
+      padding: 8px 16px;
+      border-radius: 6px;
+      border: 1px solid #555;
+      background: #212121;
+    }
+    .diagram .arrow {
+      margin: 0 10px;
+      font-size: 20px;
+      color: #90caf9;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .flex-1 {
+      flex: 1 1 300px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    // Helpers
+    function mulberry32(a) {
+      return function () {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        let t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    function randn(random) {
+      let u = 0, v = 0;
+      while (u === 0) u = random();
+      while (v === 0) v = random();
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+    const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+    const std = arr => {
+      const m = mean(arr);
+      return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
+    };
+
+    function App() {
+      // Dataset state
+      const [numSamples, setNumSamples] = useState(2000);
+      const [seqLen, setSeqLen] = useState(50);
+      const [noise, setNoise] = useState(0.05);
+      const [seed, setSeed] = useState("");
+      const [ampMin, setAmpMin] = useState(0.8);
+      const [ampMax, setAmpMax] = useState(1.2);
+      const [freqMin, setFreqMin] = useState(0.15);
+      const [freqMax, setFreqMax] = useState(0.35);
+      const [showK, setShowK] = useState(8);
+      const [startIdx, setStartIdx] = useState(0);
+
+      // Training state
+      const [units, setUnits] = useState(32);
+      const [epochs, setEpochs] = useState(30);
+      const [batchSize, setBatchSize] = useState(64);
+      const [lr, setLr] = useState(0.001);
+      const [valSplit, setValSplit] = useState(0.1);
+
+      // Data
+      const [XData, setXData] = useState(null);
+      const [yData, setYData] = useState(null);
+      const [yPred, setYPred] = useState(null);
+      const normRef = useRef(null);
+
+      // Model
+      const modelRef = useRef(null);
+
+      // Charts
+      const mainChartRef = useRef(null);
+      const lossChartRef = useRef(null);
+      const predChartRef = useRef(null);
+      const compareChartRef = useRef(null);
+
+      // Canvas refs
+      const mainCanvasRef = useRef(null);
+      const lossCanvasRef = useRef(null);
+      const predCanvasRef = useRef(null);
+      const compareCanvasRef = useRef(null);
+
+      // UI
+      const [status, setStatus] = useState("");
+      const [isTraining, setIsTraining] = useState(false);
+      const [autoCycle, setAutoCycle] = useState(false);
+
+      // Comparison
+      const [compareResults, setCompareResults] = useState([]);
+
+      const appendStatus = msg => setStatus(s => s + msg + "\n");
+
+      // Generate dataset
+      const generateDataset = () => {
+        const N = +numSamples;
+        const L = +seqLen;
+        let aMin = +ampMin, aMax = +ampMax;
+        let fMin = +freqMin, fMax = +freqMax;
+        if (aMin > aMax) [aMin, aMax] = [aMax, aMin];
+        if (fMin > fMax) [fMin, fMax] = [fMax, fMin];
+
+        let rng = Math.random;
+        if (seed !== "") rng = mulberry32(parseInt(seed, 10));
+
+        const X = [];
+        const y = [];
+        for (let i = 0; i < N; i++) {
+          const seq = [];
+          const phase = rng() * Math.PI * 2;
+          const A = aMin + (aMax - aMin) * rng();
+          const w = fMin + (fMax - fMin) * rng();
+          for (let t = 0; t <= L; t++) {
+            const base = A * Math.sin(w * t + phase);
+            const noisy = base + noise * randn(rng);
+            if (t < L) seq.push(noisy);
+            else y.push(noisy);
+          }
+          X.push(seq);
+        }
+        setStartIdx(0);
+        setXData(X);
+        setYData(y);
+        setYPred(null);
+        setCompareResults([]);
+        appendStatus(
+          `Generated dataset: N=${N}, seqLen=${L}, noise=${noise}, amp=[${aMin},${aMax}], freq=[${fMin},${fMax}]`
+        );
+      };
+
+      // Charts: main
+      const rebuildMainChart = () => {
+        if (!XData || !yData) return;
+        const start = startIdx;
+        const K = showK;
+        const L = XData[0].length;
+
+        const datasets = [];
+        const colors = [
+          "#42a5f5", "#66bb6a", "#ef5350", "#ab47bc",
+          "#ffa726", "#26c6da", "#7e57c2", "#ec407a"
+        ];
+
+        for (let k = 0; k < K; k++) {
+          const idx = start + k;
+          if (idx >= XData.length) break;
+          const color = colors[k % colors.length];
+
+          datasets.push({
+            label: `sample ${idx} input`,
+            type: "line",
+            data: XData[idx].map((v, t) => ({ x: t, y: v })),
+            borderColor: color,
+            tension: 0.3,
+            pointRadius: 0
+          });
+
+          datasets.push({
+            label: `sample ${idx} target`,
+            type: "scatter",
+            data: [{ x: L, y: yData[idx] }],
+            backgroundColor: "red",
+            borderColor: "red",
+            pointRadius: 5
+          });
+
+          if (yPred && !Number.isNaN(yPred[idx])) {
+            datasets.push({
+              label: `sample ${idx} pred`,
+              type: "scatter",
+              data: [{ x: L, y: yPred[idx] }],
+              backgroundColor: "white",
+              borderColor: "white",
+              pointRadius: 5
+            });
+          }
+        }
+
+        if (mainChartRef.current) mainChartRef.current.destroy();
+        const ctx = mainCanvasRef.current.getContext("2d");
+        mainChartRef.current = new Chart(ctx, {
+          type: "scatter",
+          data: { datasets },
+          options: {
+            animation: { duration: 600 },
+            plugins: { legend: { labels: { color: "#fff", boxWidth: 12 } } },
+            scales: {
+              x: {
+                type: "linear",
+                ticks: { color: "#fff" },
+                title: { display: true, text: "Time step", color: "#fff" }
+              },
+              y: {
+                ticks: { color: "#fff" },
+                title: { display: true, text: "Value", color: "#fff" }
+              }
+            }
+          }
+        });
+      };
+
+      // Charts: loss
+      const rebuildLossChart = (labels, lossArr, valLossArr) => {
+        if (lossChartRef.current) lossChartRef.current.destroy();
+        const ctx = lossCanvasRef.current.getContext("2d");
+        lossChartRef.current = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [
+              { label: "loss", data: lossArr, borderColor: "#42a5f5", fill: false },
+              { label: "val_loss", data: valLossArr, borderColor: "#ef5350", fill: false }
+            ]
+          },
+          options: {
+            animation: { duration: 400 },
+            plugins: { legend: { labels: { color: "#fff" } } },
+            scales: {
+              x: { ticks: { color: "#fff" }, title: { display: true, text: "Epoch", color: "#fff" } },
+              y: { ticks: { color: "#fff" }, title: { display: true, text: "MSE", color: "#fff" } }
+            }
+          }
+        });
+      };
+
+      // Charts: predictions
+      const rebuildPredChart = () => {
+        if (!XData || !yData || !yPred) return;
+        const L = XData[0].length;
+        const datasets = [];
+        const K = 5;
+        for (let i = 0; i < K; i++) {
+          const idx = i * 20;
+          if (idx >= XData.length) break;
+          datasets.push({
+            label: `sample ${idx} input`,
+            type: "line",
+            data: XData[idx].map((v, t) => ({ x: t, y: v })),
+            borderColor: "#81d4fa",
+            tension: 0.3,
+            pointRadius: 0
+          });
+          datasets.push({
+            label: `sample ${idx} target`,
+            type: "scatter",
+            data: [{ x: L, y: yData[idx] }],
+            backgroundColor: "red",
+            pointRadius: 5
+          });
+          datasets.push({
+            label: `sample ${idx} pred`,
+            type: "scatter",
+            data: [{ x: L, y: yPred[idx] }],
+            backgroundColor: "white",
+            pointRadius: 5
+          });
+        }
+
+        if (predChartRef.current) predChartRef.current.destroy();
+        const ctx = predCanvasRef.current.getContext("2d");
+        predChartRef.current = new Chart(ctx, {
+          type: "scatter",
+          data: { datasets },
+          options: {
+            animation: { duration: 600 },
+            plugins: { legend: { labels: { color: "#fff" } } },
+            scales: {
+              x: { type: "linear", ticks: { color: "#fff" } },
+              y: { ticks: { color: "#fff" } }
+            }
+          }
+        });
+      };
+
+      // Charts: comparison
+      const rebuildCompareChart = () => {
+        if (!compareResults.length) return;
+        if (compareChartRef.current) compareChartRef.current.destroy();
+        const ctx = compareCanvasRef.current.getContext("2d");
+        const labels = compareResults.map(r => r.units);
+        const vals = compareResults.map(r => r.valLoss);
+        compareChartRef.current = new Chart(ctx, {
+          type: "bar",
+          data: {
+            labels,
+            datasets: [{
+              label: "Final val_loss vs units",
+              data: vals,
+              backgroundColor: "#42a5f5"
+            }]
+          },
+          options: {
+            plugins: { legend: { labels: { color: "#fff" } } },
+            scales: {
+              x: { ticks: { color: "#fff" }, title: { display: true, text: "LSTM units", color: "#fff" } },
+              y: { ticks: { color: "#fff" }, title: { display: true, text: "val_loss", color: "#fff" } }
+            }
+          }
+        });
+      };
+
+      useEffect(() => { rebuildMainChart(); }, [XData, yData, yPred, startIdx, showK]);
+      useEffect(() => { rebuildPredChart(); }, [XData, yData, yPred]);
+      useEffect(() => { rebuildCompareChart(); }, [compareResults]);
+
+      // Build model
+      const buildModel = (L, u) => {
+        const m = tf.sequential();
+        m.add(tf.layers.lstm({ units: u, inputShape: [L, 1] }));
+        m.add(tf.layers.dense({ units: 1 }));
+        m.compile({ optimizer: tf.train.adam(lr), loss: "meanSquaredError" });
+        return m;
+      };
+
+      // Train
+      const trainModel = async () => {
+        if (!XData || !yData) {
+          alert("Generate dataset first.");
+          return;
+        }
+        setIsTraining(true);
+        appendStatus("Starting training...");
+        const N = XData.length;
+        const L = XData[0].length;
+
+        const flat = XData.flat();
+        const m = mean(flat), s = std(flat);
+        const ym = mean(yData), ys = std(yData);
+        normRef.current = { m, s, ym, ys };
+
+        const Xn = flat.map(v => (v - m) / s);
+        const Yn = yData.map(v => (v - ym) / ys);
+
+        const Xt = tf.tensor3d(Xn, [N, L, 1]);
+        const Yt = tf.tensor2d(Yn, [N, 1]);
+
+        if (modelRef.current) modelRef.current.dispose();
+        const model = buildModel(L, units);
+        modelRef.current = model;
+
+        const labels = [];
+        const lossArr = [];
+        const valArr = [];
+
+        await model.fit(Xt, Yt, {
+          epochs,
+          batchSize,
+          validationSplit: valSplit,
+          callbacks: {
+            onEpochEnd: (ep, logs) => {
+              appendStatus(
+                `Epoch ${ep + 1}/${epochs}  loss=${logs.loss.toFixed(4)}  val_loss=${logs.val_loss.toFixed(4)}`
+              );
+              labels.push(ep + 1);
+              lossArr.push(logs.loss);
+              valArr.push(logs.val_loss);
+              rebuildLossChart([...labels], [...lossArr], [...valArr]);
+            }
+          }
+        });
+
+        Xt.dispose(); Yt.dispose();
+        appendStatus("Training complete.");
+        setIsTraining(false);
+      };
+
+      // Predict
+      const computePredictions = async () => {
+        if (!modelRef.current || !XData) {
+          alert("Train the model first.");
+          return;
+        }
+        const N = XData.length;
+        const L = XData[0].length;
+        const flat = XData.flat();
+        const { m, s, ym, ys } = normRef.current;
+
+        const Xn = flat.map(v => (v - m) / s);
+        const Xt = tf.tensor3d(Xn, [N, L, 1]);
+        const preds = await modelRef.current.predict(Xt).array();
+        Xt.dispose();
+        const arr = preds.map(p => p[0] * ys + ym);
+        setYPred(arr);
+        appendStatus("Predictions computed.");
+      };
+
+      // Compare multiple unit sizes
+      const runComparison = async () => {
+        if (!XData || !yData) {
+          alert("Generate dataset first.");
+          return;
+        }
+        setIsTraining(true);
+        appendStatus("Running comparison of unit sizes (short training)...");
+
+        const N = XData.length;
+        const L = XData[0].length;
+        const flat = XData.flat();
+        const m = mean(flat), s = std(flat);
+        const ym = mean(yData), ys = std(yData);
+        const Xn = flat.map(v => (v - m) / s);
+        const Yn = yData.map(v => (v - ym) / ys);
+        const Xt = tf.tensor3d(Xn, [N, L, 1]);
+        const Yt = tf.tensor2d(Yn, [N, 1]);
+
+        const unitList = [16, 32, 64];
+        const results = [];
+
+        for (const u of unitList) {
+          appendStatus(`Training model with units=${u} for 10 epochs...`);
+          const mdl = buildModel(L, u);
+          const hist = await mdl.fit(Xt, Yt, {
+            epochs: 10,
+            batchSize,
+            validationSplit: valSplit
+          });
+          const lastVal = hist.history.val_loss[hist.history.val_loss.length - 1];
+          results.push({ units: u, valLoss: lastVal });
+          mdl.dispose();
+          appendStatus(`units=${u}  final val_loss=${lastVal.toFixed(4)}`);
+        }
+
+        Xt.dispose(); Yt.dispose();
+        setCompareResults(results);
+        setIsTraining(false);
+      };
+
+      // CSV export/import
+      const exportCSV = () => {
+        if (!XData || !yData) {
+          alert("Generate dataset first.");
+          return;
+        }
+        const L = XData[0].length;
+        const header = [
+          ...Array(L).keys().map(i => `x_${i}`),
+          "target"
+        ].join(",");
+        const rows = XData.map((seq, idx) =>
+          seq.map(v => v.toFixed(6)).join(",") + "," + yData[idx].toFixed(6)
+        );
+        const csv = [header, ...rows].join("\n");
+        const blob = new Blob([csv], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "sine_dataset.csv";
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const importCSV = e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = evt => {
+          const text = evt.target.result;
+          const lines = text.trim().split(/\r?\n/);
+          if (lines.length < 2) return;
+          const header = lines[0].split(",");
+          const L = header.length - 1;
+          const X = [];
+          const y = [];
+          for (let i = 1; i < lines.length; i++) {
+            const parts = lines[i].split(",");
+            if (parts.length !== L + 1) continue;
+            const seq = parts.slice(0, L).map(Number);
+            const target = Number(parts[L]);
+            X.push(seq);
+            y.push(target);
+          }
+          setSeqLen(L);
+          setXData(X);
+          setYData(y);
+          setYPred(null);
+          setCompareResults([]);
+          appendStatus(`Imported CSV with ${X.length} samples, seqLen=${L}`);
+        };
+        reader.readAsText(file);
+      };
+
+      // Auto cycling
+      useEffect(() => {
+        if (!autoCycle || !XData) return;
+        const handle = setInterval(() => {
+          setStartIdx(prev => {
+            const maxStart = Math.max(0, XData.length - showK);
+            return prev >= maxStart ? 0 : prev + 1;
+          });
+        }, 1200);
+        return () => clearInterval(handle);
+      }, [autoCycle, XData, showK]);
+
+      // Initial dataset
+      useEffect(() => { generateDataset(); }, []);
+
+      return (
+        <div>
+          <h1>LSTM Next-Step Predictor — Sine Waves</h1>
+          <div className="subtitle">
+            Synthetic dataset: each sample is points from a noisy sine wave with random amplitude,
+            frequency, and phase. The target is the next (n+1) point.
+          </div>
+
+          {/* 1. Architecture & LSTM Internals */}
+          <h2>1. Architecture & LSTM Internals</h2>
+          <div className="panel">
+            <details open>
+              <summary>Neural Network Architecture (Concise)</summary>
+              <ul>
+                <li>Input: sequence window of length n, shape [batch, n, 1].</li>
+                <li>Core: single LSTM(units) layer producing a vector of size units.</li>
+                <li>Head: Dense(1) producing scalar next-step prediction.</li>
+                <li>Loss: Mean Squared Error (MSE). Optimizer: Adam (e.g., lr = 1e-3).</li>
+                <li>Shapes: LSTM output [batch, units] → Dense → [batch, 1].</li>
+              </ul>
+              <div className="diagram">
+                <div className="box">Input (n × 1)</div>
+                <div className="arrow">→</div>
+                <div className="box">LSTM (units)</div>
+                <div className="arrow">→</div>
+                <div className="box">Dense(1)</div>
+              </div>
+            </details>
+            <details style={{ marginTop: 12 }} open>
+              <summary>LSTM Internals (Concise)</summary>
+              <ul>
+                <li>Forget gate: decides what to discard from the cell state.</li>
+                <li>Input gate & candidate: decide what new information to store.</li>
+                <li>Cell update combines forget and input to update the cell state.</li>
+                <li>Output gate: decides which part of the cell state to output.</li>
+              </ul>
+            </details>
+          </div>
+
+          {/* 2. Dataset & Visualization */}
+          <h2>2. Dataset & Visualization</h2>
+          <div className="panel">
+            <div className="controls">
+              <div>
+                <label>Number of samples</label>
+                <input
+                  type="number"
+                  value={numSamples}
+                  onChange={e => setNumSamples(+e.target.value)}
+                />
+              </div>
+              <div>
+                <label>Sequence length</label>
+                <input
+                  type="number"
+                  value={seqLen}
+                  onChange={e => setSeqLen(+e.target.value)}
+                />
+              </div>
+              <div>
+                <label>Noise (std)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={noise}
+                  onChange={e => setNoise(+e.target.value)}
+                />
+              </div>
+              <div>
+                <label>Seed (optional)</label>
+                <input value={seed} onChange={e => setSeed(e.target.value)} />
+              </div>
+              <div>
+                <label>Amplitude min</label>
+                <input value={ampMin} onChange={e => setAmpMin(+e.target.value)} />
+              </div>
+              <div>
+                <label>Amplitude max</label>
+                <input value={ampMax} onChange={e => setAmpMax(+e.target.value)} />
+              </div>
+              <div>
+                <label>Frequency min</label>
+                <input value={freqMin} onChange={e => setFreqMin(+e.target.value)} />
+              </div>
+              <div>
+                <label>Frequency max</label>
+                <input value={freqMax} onChange={e => setFreqMax(+e.target.value)} />
+              </div>
+              <div>
+                <label>Show K samples</label>
+                <input
+                  type="number"
+                  value={showK}
+                  onChange={e => setShowK(Math.max(1, +e.target.value))}
+                />
+              </div>
+              <div>
+                <label>Start index</label>
+                <input
+                  type="number"
+                  value={startIdx}
+                  onChange={e => setStartIdx(Math.max(0, +e.target.value))}
+                />
+              </div>
+            </div>
+            <div>
+              <button onClick={generateDataset} disabled={isTraining}>Generate Dataset + Plot</button>
+              <button
+                className="secondary"
+                onClick={() => setAutoCycle(v => !v)}
+                disabled={!XData}
+              >
+                {autoCycle ? "Stop Auto-Cycle" : "Start Auto-Cycle"}
+              </button>
+              <button className="secondary" onClick={exportCSV} disabled={!XData}>
+                Export CSV
+              </button>
+              <label style={{ marginLeft: 8, fontSize: 12 }}>
+                Import CSV:
+                <input type="file" accept=".csv" onChange={importCSV} />
+              </label>
+            </div>
+            <h3>
+              {showK} sample(s) overlaid — inputs (lines) and targets (red dots)
+            </h3>
+            <div className="sample-buttons">
+              {XData &&
+                [...Array(showK).keys()].map(k => {
+                  const idx = startIdx + k;
+                  if (idx >= XData.length) return null;
+                  return (
+                    <button
+                      key={idx}
+                      className="secondary"
+                      onClick={() => setStartIdx(idx)}
+                    >
+                      Sample {idx}
+                    </button>
+                  );
+                })}
+            </div>
+            <canvas ref={mainCanvasRef} height="350"></canvas>
+          </div>
+
+          {/* 3. Train LSTM */}
+          <h2>3. Train LSTM (TF.js)</h2>
+          <div className="panel">
+            <div className="controls">
+              <div>
+                <label>Units</label>
+                <input value={units} onChange={e => setUnits(+e.target.value)} />
+              </div>
+              <div>
+                <label>Epochs</label>
+                <input value={epochs} onChange={e => setEpochs(+e.target.value)} />
+              </div>
+              <div>
+                <label>Batch size</label>
+                <input value={batchSize} onChange={e => setBatchSize(+e.target.value)} />
+              </div>
+              <div>
+                <label>Learning rate</label>
+                <input
+                  type="number"
+                  step="0.0001"
+                  value={lr}
+                  onChange={e => setLr(+e.target.value)}
+                />
+              </div>
+              <div>
+                <label>Validation split</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  value={valSplit}
+                  onChange={e => setValSplit(+e.target.value)}
+                />
+              </div>
+            </div>
+            <div>
+              <button onClick={trainModel} disabled={isTraining || !XData}>
+                Train LSTM
+              </button>
+              <button onClick={computePredictions} disabled={isTraining || !modelRef.current}>
+                Show Predictions
+              </button>
+              <button
+                className="secondary"
+                onClick={runComparison}
+                disabled={isTraining || !XData}
+              >
+                Compare Unit Sizes (16, 32, 64)
+              </button>
+              <button
+                className="secondary"
+                onClick={async () => {
+                  if (!modelRef.current) { alert("Train a model first."); return; }
+                  await modelRef.current.save("downloads://sine-lstm");
+                  appendStatus("Model saved to downloads.");
+                }}
+              >
+                Save Model
+              </button>
+            </div>
+            <pre id="status">{status}</pre>
+            <div className="row">
+              <div className="flex-1">
+                <h3>Training Metrics</h3>
+                <canvas ref={lossCanvasRef} height="200"></canvas>
+              </div>
+              <div className="flex-1">
+                <h3>Predictions vs Targets</h3>
+                <canvas ref={predCanvasRef} height="200"></canvas>
+              </div>
+            </div>
+          </div>
+
+          {/* 4. LSTM Size Comparison */}
+          <h2>4. LSTM Size Comparison</h2>
+          <div className="panel">
+            <p style={{ fontSize: 13 }}>
+              This short experiment trains three models (units = 16, 32, 64) for 10 epochs each and
+              plots the final validation loss.
+            </p>
+            <canvas ref={compareCanvasRef} height="220"></canvas>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
